@@ -1,4 +1,4 @@
-'name': 'build'
+'name': 'build avkiller'
 
 'env':
   'GO_VERSION': '1.23.4'
