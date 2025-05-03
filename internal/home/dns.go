@@ -317,13 +317,7 @@ func newDNSTLSConfig(
 		return &dnsforward.TLSConfig{}, nil
 	}
 
-	cert, err := tls.X509KeyPair(conf.CertificateChainData, conf.PrivateKeyData)
-	if err != nil {
-		return nil, fmt.Errorf("parsing tls key pair: %w", err)
-	}
-
 	dnsConf = &dnsforward.TLSConfig{
-		Cert:           &cert,
 		ServerName:     conf.ServerName,
 		StrictSNICheck: conf.StrictSNICheck,
 	}
@@ -339,6 +333,21 @@ func newDNSTLSConfig(
 	if conf.PortDNSOverQUIC != 0 {
 		dnsConf.QUICListenAddrs = ipsToUDPAddrs(addrs, conf.PortDNSOverQUIC)
 	}
+
+	cert, err := tls.X509KeyPair(conf.CertificateChainData, conf.PrivateKeyData)
+	if err != nil {
+		const format = "parsing tls key pair: %w"
+		if conf.AllowUnencryptedDoH {
+			// TODO(s.chzhen):  Use [slog.Logger].
+			log.Info("warning: %s: %s", format, err)
+
+			return dnsConf, nil
+		}
+
+		return nil, fmt.Errorf(format, err)
+	}
+
+	dnsConf.Cert = &cert
 
 	return dnsConf, nil
 }
