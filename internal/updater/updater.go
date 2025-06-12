@@ -71,7 +71,7 @@ type Updater struct {
 func DefaultVersionURL() *url.URL {
 	return &url.URL{
 		Scheme: urlutil.SchemeHTTPS,
-		Host:   "static.adtidy.org",
+		Host:   "",
 		Path:   path.Join("adguardhome", version.Channel(), "version.json"),
 	}
 }
