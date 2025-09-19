@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
 	"github.com/AdguardTeam/AdGuardHome/internal/client"
 	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
@@ -66,9 +67,9 @@ func TestValidateCertificates(t *testing.T) {
 	ctx := testutil.ContextWithTimeout(t, testTimeout)
 
 	m, err := newTLSManager(ctx, &tlsManagerConfig{
-		logger:         testLogger,
-		configModified: func() {},
-		servePlainDNS:  false,
+		logger:        testLogger,
+		confModifier:  agh.EmptyConfigModifier{},
+		servePlainDNS: false,
 	})
 	require.NoError(t, err)
 
@@ -103,6 +104,29 @@ func TestValidateCertificates(t *testing.T) {
 		assert.Equal(t, "CN=AdGuard Home,O=AdGuard Ltd", status.Issuer)
 		assert.Equal(t, notBefore, status.NotBefore)
 		assert.Equal(t, notAfter, status.NotAfter)
+		assert.True(t, status.ValidPair)
+	})
+
+	t.Run("no_ip_in_cert", func(t *testing.T) {
+		caCert, chainPEM, leafKeyPEM := newCertWithoutIP(t)
+
+		m.rootCerts = x509.NewCertPool()
+		m.rootCerts.AddCert(caCert)
+
+		status := &tlsConfigStatus{}
+		var ok bool
+		ok, err = m.validateCertificate(ctx, status, chainPEM, "")
+		assert.True(t, ok)
+		assert.ErrorIs(t, err, errNoIPInCert)
+		assert.True(t, status.ValidCert)
+		assert.True(t, status.ValidChain)
+
+		status = &tlsConfigStatus{}
+		err = m.validateCertificates(ctx, status, chainPEM, leafKeyPEM, "")
+		assert.ErrorIs(t, err, errNoIPInCert)
+		assert.True(t, status.ValidCert)
+		assert.True(t, status.ValidChain)
+		assert.True(t, status.ValidKey)
 		assert.True(t, status.ValidPair)
 	})
 }
@@ -142,6 +166,68 @@ func storeGlobals(tb testing.TB) {
 		globalContext.mux = mux
 		globalContext.web = web
 	})
+}
+
+// newCertWithoutIP generates a CA certificate, a leaf certificate without an IP
+// address, and the PEM-encoded leaf private key.
+func newCertWithoutIP(tb testing.TB) (
+	caCert *x509.Certificate,
+	chainPEM []byte,
+	leafKeyPEM []byte,
+) {
+	tb.Helper()
+
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(tb, err)
+
+	now := time.Now()
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	require.NoError(tb, err)
+
+	caCert, err = x509.ParseCertificate(caDER)
+	require.NoError(tb, err)
+
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(tb, err)
+
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+
+	leafDER, err := x509.CreateCertificate(
+		rand.Reader,
+		leafTmpl,
+		caTmpl,
+		&leafKey.PublicKey,
+		caKey,
+	)
+	require.NoError(tb, err)
+
+	buf := bytes.Buffer{}
+	err = pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	require.NoError(tb, err)
+
+	err = pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	require.NoError(tb, err)
+
+	leafKeyPEM = pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(leafKey),
+	})
+
+	return caCert, buf.Bytes(), leafKeyPEM
 }
 
 // newCertAndKey is a helper function that generates certificate and key.
@@ -246,8 +332,8 @@ func TestTLSManager_Reload(t *testing.T) {
 	writeCertAndKey(t, certDER, certPath, key, keyPath)
 
 	m, err := newTLSManager(ctx, &tlsManagerConfig{
-		logger:         testLogger,
-		configModified: func() {},
+		logger:       testLogger,
+		confModifier: agh.EmptyConfigModifier{},
 		tlsSettings: tlsConfigSettings{
 			Enabled:         true,
 			CertificatePath: certPath,
@@ -257,7 +343,7 @@ func TestTLSManager_Reload(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	web, err := initWeb(ctx, options{}, nil, nil, testLogger, nil, nil, false)
+	web, err := initWeb(ctx, options{}, nil, nil, testLogger, nil, nil, agh.EmptyConfigModifier{}, false)
 	require.NoError(t, err)
 
 	m.setWebAPI(web)
@@ -272,7 +358,9 @@ func TestTLSManager_Reload(t *testing.T) {
 
 	// The [tlsManager.reload] method will start the DNS server and it should be
 	// stopped after the test ends.
-	testutil.CleanupAndRequireSuccess(t, globalContext.dnsServer.Stop)
+	testutil.CleanupAndRequireSuccess(t, func() (err error) {
+		return globalContext.dnsServer.Stop(testutil.ContextWithTimeout(t, testTimeout))
+	})
 
 	conf = m.config()
 	assertCertSerialNumber(t, conf, snAfter)
@@ -285,8 +373,8 @@ func TestTLSManager_HandleTLSStatus(t *testing.T) {
 	)
 
 	m, err := newTLSManager(ctx, &tlsManagerConfig{
-		logger:         testLogger,
-		configModified: func() {},
+		logger:       testLogger,
+		confModifier: agh.EmptyConfigModifier{},
 		tlsSettings: tlsConfigSettings{
 			Enabled:          true,
 			CertificateChain: string(testCertChainData),
@@ -321,13 +409,13 @@ func TestValidateTLSSettings(t *testing.T) {
 	)
 
 	m, err := newTLSManager(ctx, &tlsManagerConfig{
-		logger:         testLogger,
-		configModified: func() {},
-		servePlainDNS:  false,
+		logger:        testLogger,
+		confModifier:  agh.EmptyConfigModifier{},
+		servePlainDNS: false,
 	})
 	require.NoError(t, err)
 
-	web, err := initWeb(ctx, options{}, nil, nil, testLogger, nil, nil, false)
+	web, err := initWeb(ctx, options{}, nil, nil, testLogger, nil, nil, agh.EmptyConfigModifier{}, false)
 	require.NoError(t, err)
 
 	m.setWebAPI(web)
@@ -420,8 +508,8 @@ func TestTLSManager_HandleTLSValidate(t *testing.T) {
 	)
 
 	m, err := newTLSManager(ctx, &tlsManagerConfig{
-		logger:         testLogger,
-		configModified: func() {},
+		logger:       testLogger,
+		confModifier: agh.EmptyConfigModifier{},
 		tlsSettings: tlsConfigSettings{
 			Enabled:          true,
 			CertificateChain: string(testCertChainData),
@@ -431,7 +519,7 @@ func TestTLSManager_HandleTLSValidate(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	web, err := initWeb(ctx, options{}, nil, nil, testLogger, nil, nil, false)
+	web, err := initWeb(ctx, options{}, nil, nil, testLogger, nil, nil, agh.EmptyConfigModifier{}, false)
 	require.NoError(t, err)
 
 	m.setWebAPI(web)
@@ -476,15 +564,17 @@ func TestTLSManager_HandleTLSConfigure(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = globalContext.dnsServer.Prepare(&dnsforward.ServerConfig{
-		TLSConf: &dnsforward.TLSConfig{},
-		Config: dnsforward.Config{
-			UpstreamMode:     dnsforward.UpstreamModeLoadBalance,
-			EDNSClientSubnet: &dnsforward.EDNSClientSubnet{Enabled: false},
-			ClientsContainer: dnsforward.EmptyClientsContainer{},
-		},
-		ServePlainDNS: true,
-	})
+	err = globalContext.dnsServer.Prepare(
+		testutil.ContextWithTimeout(t, testTimeout),
+		&dnsforward.ServerConfig{
+			TLSConf: &dnsforward.TLSConfig{},
+			Config: dnsforward.Config{
+				UpstreamMode:     dnsforward.UpstreamModeLoadBalance,
+				EDNSClientSubnet: &dnsforward.EDNSClientSubnet{Enabled: false},
+				ClientsContainer: dnsforward.EmptyClientsContainer{},
+			},
+			ServePlainDNS: true,
+		})
 	require.NoError(t, err)
 
 	globalContext.clients.storage, err = client.NewStorage(ctx, &client.StorageConfig{
@@ -511,8 +601,8 @@ func TestTLSManager_HandleTLSConfigure(t *testing.T) {
 
 	// Initialize the TLS manager and assert its configuration.
 	m, err := newTLSManager(ctx, &tlsManagerConfig{
-		logger:         testLogger,
-		configModified: func() {},
+		logger:       testLogger,
+		confModifier: agh.EmptyConfigModifier{},
 		tlsSettings: tlsConfigSettings{
 			Enabled:         true,
 			CertificatePath: certPath,
@@ -522,7 +612,7 @@ func TestTLSManager_HandleTLSConfigure(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	web, err := initWeb(ctx, options{}, nil, nil, testLogger, nil, nil, false)
+	web, err := initWeb(ctx, options{}, nil, nil, testLogger, nil, nil, agh.EmptyConfigModifier{}, false)
 	require.NoError(t, err)
 
 	m.setWebAPI(web)
@@ -551,7 +641,9 @@ func TestTLSManager_HandleTLSConfigure(t *testing.T) {
 
 	// The [tlsManager.handleTLSConfigure] method will start the DNS server and
 	// it should be stopped after the test ends.
-	testutil.CleanupAndRequireSuccess(t, globalContext.dnsServer.Stop)
+	testutil.CleanupAndRequireSuccess(t, func() (err error) {
+		return globalContext.dnsServer.Stop(testutil.ContextWithTimeout(t, testTimeout))
+	})
 
 	res := &tlsConfig{
 		tlsConfigStatus: &tlsConfigStatus{},

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/updater"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
@@ -19,6 +20,7 @@ import (
 	"github.com/AdguardTeam/golibs/netutil/httputil"
 	"github.com/AdguardTeam/golibs/netutil/urlutil"
 	"github.com/AdguardTeam/golibs/osutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
 	"github.com/NYTimes/gziphandler"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
@@ -38,6 +40,9 @@ const (
 )
 
 type webConfig struct {
+	// CommandConstructor is used to run external commands.  It must not be nil.
+	CommandConstructor executil.CommandConstructor
+
 	updater *updater.Updater
 
 	// logger is a slog logger used in webAPI. It must not be nil.
@@ -46,6 +51,9 @@ type webConfig struct {
 	// baseLogger is used to create loggers for other entities.  It must not be
 	// nil.
 	baseLogger *slog.Logger
+
+	// confModifier is used to update the global configuration.
+	confModifier agh.ConfigModifier
 
 	// tlsManager contains the current configuration and state of TLS
 	// encryption.  It must not be nil.
@@ -71,6 +79,9 @@ type webConfig struct {
 	// WriteTimeout is an option to pass to http.Server for setting an
 	// appropriate field.
 	WriteTimeout time.Duration
+
+	// defaultWebPort is the suggested default HTTP port for the install wizard.
+	defaultWebPort uint16
 
 	firstRun bool
 
@@ -104,6 +115,12 @@ type httpsServer struct {
 type webAPI struct {
 	conf *webConfig
 
+	// confModifier is used to update the global configuration.
+	confModifier agh.ConfigModifier
+
+	// cmdCons is used to run external commands.
+	cmdCons executil.CommandConstructor
+
 	// TODO(a.garipov): Refactor all these servers.
 	httpServer *http.Server
 
@@ -134,11 +151,13 @@ func newWebAPI(ctx context.Context, conf *webConfig) (w *webAPI) {
 	conf.logger.InfoContext(ctx, "initializing")
 
 	w = &webAPI{
-		conf:       conf,
-		logger:     conf.logger,
-		baseLogger: conf.baseLogger,
-		tlsManager: conf.tlsManager,
-		auth:       conf.auth,
+		conf:         conf,
+		confModifier: conf.confModifier,
+		cmdCons:      conf.CommandConstructor,
+		logger:       conf.logger,
+		baseLogger:   conf.baseLogger,
+		tlsManager:   conf.tlsManager,
+		auth:         conf.auth,
 	}
 
 	clientFS := http.FileServer(http.FS(conf.clientFS))

@@ -107,7 +107,8 @@ var _ Interface = (*server)(nil)
 func Create(conf *ServerConfig) (s *server, err error) {
 	s = &server{
 		conf: &ServerConfig{
-			ConfigModified: conf.ConfigModified,
+			CommandConstructor: conf.CommandConstructor,
+			ConfModifier:       conf.ConfModifier,
 
 			HTTPRegister: conf.HTTPRegister,
 
